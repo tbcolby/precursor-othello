@@ -188,13 +188,13 @@ fn draw_board(app: &OthelloApp, gam: &Gam, board: &Board, cursor: Option<(u8, u8
         }
     }
 
-    // Draw board border
+    // Draw board background (light fill with dark border)
     gam.draw_rectangle(
         gid,
         Rectangle::new_with_style(
             origin,
             Point::new(origin.x + board_px, origin.y + board_px),
-            DrawStyle::new(PixelColor::Dark, PixelColor::Light, 2),
+            DrawStyle::new(PixelColor::Light, PixelColor::Dark, 2),
         ),
     )
     .ok();
