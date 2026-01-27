@@ -252,7 +252,7 @@ fn draw_board(app: &OthelloApp, gam: &Gam, board: &Board, cursor: Option<(u8, u8
                     Circle::new_with_style(
                         center,
                         disc_r,
-                        DrawStyle::new(stroke, fill, 2),
+                        DrawStyle::new(fill, stroke, 2),  // fill first, then stroke
                     ),
                 )
                 .ok();
