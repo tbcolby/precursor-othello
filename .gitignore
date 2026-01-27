@@ -1,0 +1,16 @@
+# Build artifacts
+/target/
+libs/othello-core/target/
+
+# OS files
+.DS_Store
+*.swp
+*.swo
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Cargo lock for library (keep for app)
+# Cargo.lock is committed for reproducible builds

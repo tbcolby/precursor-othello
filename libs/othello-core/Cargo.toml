@@ -1,0 +1,16 @@
+[package]
+name = "othello-core"
+version = "0.1.0"
+authors = ["Tyler Colby"]
+edition = "2021"
+description = "Othello game engine with AI - no_std compatible"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+# None! Pure Rust, no_std compatible
+
+[dev-dependencies]
+rand = "0.8"
