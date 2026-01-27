@@ -18,10 +18,10 @@ mod ai;
 mod opening;
 
 pub use board::{Board, Player};
-pub use moves::{Move, MoveList};
+pub use moves::{Move, MoveList, count_moves, legal_moves_bitboard, calculate_flips};
 pub use game::{GameState, GameResult};
 pub use eval::evaluate;
-pub use ai::{Difficulty, find_best_move};
+pub use ai::{Difficulty, find_best_move, get_hint};
 pub use opening::OpeningBook;
 
 /// Position on the board (0-63)

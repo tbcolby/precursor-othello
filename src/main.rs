@@ -54,7 +54,7 @@ fn main() -> ! {
     // Register UX with GAM
     let token = gam
         .register_ux(gam::UxRegistration {
-            app_name: xous_ipc::String::from_str(SERVER_NAME),
+            app_name: String::from(SERVER_NAME),
             ux_type: gam::UxType::Chat,
             predictor: None,
             listener: sid.to_array(),

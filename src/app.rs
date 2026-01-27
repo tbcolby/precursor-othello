@@ -312,7 +312,7 @@ impl OthelloApp {
             }
             MenuItem::Hint => {
                 if let AppState::Playing { game, cursor_pos, .. } = &mut self.state {
-                    if let Some(pos) = othello_core::ai::get_hint(game.board(), game.current_player()) {
+                    if let Some(pos) = othello_core::get_hint(game.board(), game.current_player()) {
                         let (row, col) = othello_core::pos_to_rc(pos);
                         *cursor_pos = (row, col);
                     }
@@ -326,13 +326,19 @@ impl OthelloApp {
                 }
             }
             MenuItem::Resign => {
-                if let AppState::Playing { game, mode, player_color, .. } = &self.state {
+                // Extract values before mutating
+                let data = if let AppState::Playing { game, mode, player_color, .. } = &self.state {
+                    Some((game.clone(), *mode, *player_color))
+                } else {
+                    None
+                };
+                if let Some((game_clone, mode_copy, player_copy)) = data {
                     // Record loss and go to game over
-                    self.update_stats_loss(*mode);
+                    self.update_stats_loss(mode_copy);
                     self.state = AppState::GameOver {
-                        game: game.clone(),
-                        mode: *mode,
-                        player_color: *player_color,
+                        game: game_clone,
+                        mode: mode_copy,
+                        player_color: player_copy,
                     };
                 }
             }
@@ -543,7 +549,7 @@ impl OthelloApp {
             }
             // F2 for hint
             '\u{F002}' | '\u{0092}' => {
-                if let Some(pos) = othello_core::ai::get_hint(game.board(), game.current_player()) {
+                if let Some(pos) = othello_core::get_hint(game.board(), game.current_player()) {
                     let (row, col) = othello_core::pos_to_rc(pos);
                     *cursor_pos = (row, col);
                 }
@@ -565,26 +571,33 @@ impl OthelloApp {
 
     /// Handle game over transition
     fn handle_game_over(&mut self) {
-        if let AppState::Playing { game, mode, player_color, .. } = &self.state {
+        // Extract values before mutating
+        let data = if let AppState::Playing { game, mode, player_color, .. } = &self.state {
+            let result = game.result();
+            let winner = result.as_ref().and_then(|r| r.winner());
+            Some((game.clone(), *mode, *player_color, winner))
+        } else {
+            None
+        };
+
+        if let Some((game_clone, mode_copy, player_color_copy, winner)) = data {
             // Update statistics
-            if let Some(result) = game.result() {
-                match mode {
-                    GameMode::VsCpu(difficulty) => {
-                        match result.winner() {
-                            Some(winner) if winner == *player_color => {
-                                self.update_stats_win(*mode);
-                            }
-                            Some(_) => {
-                                self.update_stats_loss(*mode);
-                            }
-                            None => {
-                                self.update_stats_draw(*mode);
-                            }
+            match mode_copy {
+                GameMode::VsCpu(_) => {
+                    match winner {
+                        Some(w) if w == player_color_copy => {
+                            self.update_stats_win(mode_copy);
+                        }
+                        Some(_) => {
+                            self.update_stats_loss(mode_copy);
+                        }
+                        None => {
+                            self.update_stats_draw(mode_copy);
                         }
                     }
-                    GameMode::TwoPlayer => {
-                        self.stats.two_player_games += 1;
-                    }
+                }
+                GameMode::TwoPlayer => {
+                    self.stats.two_player_games += 1;
                 }
             }
 
@@ -596,9 +609,9 @@ impl OthelloApp {
             self.has_save = false;
 
             self.state = AppState::GameOver {
-                game: game.clone(),
-                mode: *mode,
-                player_color: *player_color,
+                game: game_clone,
+                mode: mode_copy,
+                player_color: player_color_copy,
             };
         }
     }

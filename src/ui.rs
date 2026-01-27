@@ -1,6 +1,6 @@
 //! UI drawing functions
 
-use gam::{Gam, GlyphStyle};
+use gam::{Gam, Gid, GlyphStyle};
 use gam::menu::{Point, Rectangle, DrawStyle, PixelColor, Circle, Line, TextView, TextBounds};
 use othello_core::{Board, Player, pos, pos_to_algebraic};
 
@@ -225,14 +225,14 @@ fn draw_board(app: &OthelloApp, gam: &Gam, board: &Board, cursor: Option<(u8, u8
 
     // Get valid moves bitboard
     let valid_moves = if show_valid {
-        othello_core::moves::legal_moves_bitboard(board, current_player)
+        othello_core::legal_moves_bitboard(board, current_player)
     } else {
         0
     };
 
     // Draw discs and valid move indicators
-    let disc_r = if show_coords { 12 } else { DISC_RADIUS };
-    let valid_r = if show_coords { 3 } else { VALID_MOVE_RADIUS };
+    let disc_r: isize = if show_coords { 12 } else { DISC_RADIUS };
+    let valid_r: isize = if show_coords { 3 } else { VALID_MOVE_RADIUS };
 
     for row in 0..8 {
         for col in 0..8 {
@@ -251,7 +251,7 @@ fn draw_board(app: &OthelloApp, gam: &Gam, board: &Board, cursor: Option<(u8, u8
                     gid,
                     Circle::new_with_style(
                         center,
-                        disc_r as u16,
+                        disc_r,
                         DrawStyle::new(stroke, fill, 2),
                     ),
                 )
@@ -262,7 +262,7 @@ fn draw_board(app: &OthelloApp, gam: &Gam, board: &Board, cursor: Option<(u8, u8
                     gid,
                     Circle::new_with_style(
                         center,
-                        valid_r as u16,
+                        valid_r,
                         DrawStyle::new(PixelColor::Dark, PixelColor::Dark, 1),
                     ),
                 )
@@ -330,7 +330,7 @@ fn draw_board(app: &OthelloApp, gam: &Gam, board: &Board, cursor: Option<(u8, u8
                 DrawStyle {
                     fill_color: None,
                     stroke_color: Some(PixelColor::Dark),
-                    stroke_width: CURSOR_WIDTH as u16,
+                    stroke_width: CURSOR_WIDTH,
                 },
             ),
         )
@@ -434,36 +434,47 @@ fn draw_statistics(app: &OthelloApp, gam: &Gam) {
     let start_y = HEADER_HEIGHT + 30;
     let stats = &app.stats;
 
-    let lines = [
-        "vs CPU Easy",
-        format!("  Won: {}  Lost: {}  Draw: {}", stats.easy_wins, stats.easy_losses, stats.easy_draws),
-        "",
-        "vs CPU Medium",
-        format!("  Won: {}  Lost: {}  Draw: {}", stats.medium_wins, stats.medium_losses, stats.medium_draws),
-        "",
-        "vs CPU Hard",
-        format!("  Won: {}  Lost: {}  Draw: {}", stats.hard_wins, stats.hard_losses, stats.hard_draws),
-        "",
-        "vs CPU Expert",
-        format!("  Won: {}  Lost: {}  Draw: {}", stats.expert_wins, stats.expert_losses, stats.expert_draws),
-        "",
-        format!("Two Player Games: {}", stats.two_player_games),
-    ];
+    // Draw each stats line
+    let mut y = start_y;
+    let line_height = 22isize;
 
-    for (i, line) in lines.iter().enumerate() {
-        let mut tv = TextView::new(
-            gid,
-            TextBounds::GrowableFromTl(Point::new(20, start_y + i as isize * 22), 300),
-        );
-        tv.style = if line.starts_with("vs") || line.starts_with("Two") {
-            GlyphStyle::Bold
-        } else {
-            GlyphStyle::Regular
-        };
-        use core::fmt::Write;
-        write!(tv.text, "{}", line).ok();
-        gam.post_textview(&mut tv).ok();
-    }
+    // Easy stats
+    draw_stats_line(gam, gid, y, "vs CPU Easy", true);
+    y += line_height;
+    draw_stats_line(gam, gid, y, &format!("  Won: {}  Lost: {}  Draw: {}", stats.easy_wins, stats.easy_losses, stats.easy_draws), false);
+    y += line_height * 2;
+
+    // Medium stats
+    draw_stats_line(gam, gid, y, "vs CPU Medium", true);
+    y += line_height;
+    draw_stats_line(gam, gid, y, &format!("  Won: {}  Lost: {}  Draw: {}", stats.medium_wins, stats.medium_losses, stats.medium_draws), false);
+    y += line_height * 2;
+
+    // Hard stats
+    draw_stats_line(gam, gid, y, "vs CPU Hard", true);
+    y += line_height;
+    draw_stats_line(gam, gid, y, &format!("  Won: {}  Lost: {}  Draw: {}", stats.hard_wins, stats.hard_losses, stats.hard_draws), false);
+    y += line_height * 2;
+
+    // Expert stats
+    draw_stats_line(gam, gid, y, "vs CPU Expert", true);
+    y += line_height;
+    draw_stats_line(gam, gid, y, &format!("  Won: {}  Lost: {}  Draw: {}", stats.expert_wins, stats.expert_losses, stats.expert_draws), false);
+    y += line_height * 2;
+
+    // Two player stats
+    draw_stats_line(gam, gid, y, &format!("Two Player Games: {}", stats.two_player_games), true);
+}
+
+fn draw_stats_line(gam: &Gam, gid: Gid, y: isize, text: &str, bold: bool) {
+    let mut tv = TextView::new(
+        gid,
+        TextBounds::GrowableFromTl(Point::new(20, y), 300),
+    );
+    tv.style = if bold { GlyphStyle::Bold } else { GlyphStyle::Regular };
+    use core::fmt::Write;
+    write!(tv.text, "{}", text).ok();
+    gam.post_textview(&mut tv).ok();
 }
 
 /// Draw playing state
@@ -500,8 +511,8 @@ fn draw_playing(
     let gid = app.gid;
 
     // Mobility info
-    let black_moves = othello_core::moves::count_moves(game.board(), Player::Black);
-    let white_moves = othello_core::moves::count_moves(game.board(), Player::White);
+    let black_moves = othello_core::count_moves(game.board(), Player::Black);
+    let white_moves = othello_core::count_moves(game.board(), Player::White);
 
     let mut tv = TextView::new(
         gid,
@@ -805,7 +816,7 @@ pub fn draw_menu(app: &OthelloApp, gam: &Gam) {
 
         let mut tv = TextView::new(
             gid,
-            TextBounds::GrowableFromTl(Point::new(x + 12, item_y + 4), menu_width - 24),
+            TextBounds::GrowableFromTl(Point::new(x + 12, item_y + 4), (menu_width - 24) as u16),
         );
         tv.style = if is_selected { GlyphStyle::Bold } else { GlyphStyle::Regular };
         tv.invert = is_selected;

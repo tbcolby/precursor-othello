@@ -7,7 +7,7 @@ description = "Tournament-quality Othello game with AI opponent for Precursor"
 
 [dependencies]
 # Game engine (local library)
-othello-core = { path = "libs/othello-core", default-features = false }
+othello-core = { path = "../../libs/othello-core", default-features = false }
 
 # Core Xous
 xous = "0.9.69"
