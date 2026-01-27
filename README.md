@@ -45,7 +45,9 @@ All data is stored encrypted in the PDDB:
 
 ## Screenshots
 
-*Screenshots coming soon - app builds successfully and runs in Renode emulator.*
+<img src="screenshots/main_menu.png" width="200" alt="Main Menu"> <img src="screenshots/new_game_menu.png" width="200" alt="New Game Menu"> <img src="screenshots/playing.png" width="200" alt="Gameplay">
+
+*Screenshots captured from Renode emulator*
 
 ## Controls
 

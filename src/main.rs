@@ -16,7 +16,8 @@ mod export;
 
 use num_traits::FromPrimitive;
 
-const SERVER_NAME: &str = "Othello";
+const SERVER_NAME: &str = "_Othello_";
+const APP_NAME: &str = "Othello";
 
 /// App opcodes for message handling
 #[derive(Debug, num_derive::FromPrimitive, num_derive::ToPrimitive)]
@@ -54,7 +55,7 @@ fn main() -> ! {
     // Register UX with GAM
     let token = gam
         .register_ux(gam::UxRegistration {
-            app_name: String::from(SERVER_NAME),
+            app_name: String::from(APP_NAME),
             ux_type: gam::UxType::Chat,
             predictor: None,
             listener: sid.to_array(),
