@@ -201,6 +201,17 @@ cargo test
 - **Disc Rendering**: Filled circles using GAM draw_circle
 - **AI Performance**: Expert mode typically responds in 1-3 seconds on 100MHz CPU
 
+## Changelog
+
+### v0.2.0
+
+- **Fixed F4 exit** — F4 at main menu now properly quits the app
+- **Added 'q' quit shortcut** — Press 'q' at main menu to exit
+
+### v0.1.0
+
+- Initial release with AI opponent, What If mode, and persistent storage
+
 ## License
 
 Apache License 2.0 - See [LICENSE](LICENSE) for details.

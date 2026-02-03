@@ -80,6 +80,8 @@ pub struct OthelloApp {
     pub stats: Statistics,
     /// Whether we have a saved game
     pub has_save: bool,
+    /// Whether the app should quit
+    pub should_quit: bool,
 }
 
 impl OthelloApp {
@@ -93,6 +95,7 @@ impl OthelloApp {
             settings: Settings::default(),
             stats: Statistics::default(),
             has_save: false,
+            should_quit: false,
         }
     }
 
@@ -185,7 +188,8 @@ impl OthelloApp {
     ) -> bool {
         match &self.state {
             AppState::MainMenu => {
-                // TODO: Exit app
+                // Exit the app
+                self.should_quit = true;
                 false
             }
             AppState::NewGameMenu | AppState::SettingsMenu | AppState::Statistics => {
@@ -384,6 +388,10 @@ impl OthelloApp {
             's' | 'S' => {
                 self.state = AppState::SettingsMenu;
                 true
+            }
+            'q' | 'Q' => {
+                self.should_quit = true;
+                false
             }
             _ => false,
         }

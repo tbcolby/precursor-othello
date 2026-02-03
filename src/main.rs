@@ -118,6 +118,10 @@ fn main() -> ! {
                         }
                     }
                 }
+                // Check if quit was requested
+                if app.should_quit {
+                    break;
+                }
             }),
 
             Some(AppOp::FocusChange) => xous::msg_scalar_unpack!(msg, new_state_code, _, _, _, {
