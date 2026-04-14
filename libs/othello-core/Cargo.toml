@@ -13,4 +13,4 @@ std = []
 # None! Pure Rust, no_std compatible
 
 [dev-dependencies]
-rand = "0.8"
+rand = "0.9"
