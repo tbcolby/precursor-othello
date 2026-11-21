@@ -1,0 +1,11 @@
+{
+    "othello": {
+        "context_name": "Othello",
+        "menu_name": {
+            "appmenu.othello": {
+                "en": "Othello",
+                "en-tts": "Othello"
+            }
+        }
+    }
+}

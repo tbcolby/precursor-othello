@@ -3,32 +3,21 @@ name = "othello"
 version = "0.1.0"
 authors = ["Tyler Colby"]
 edition = "2021"
-description = "Tournament-quality Othello game with AI opponent for Precursor"
+description = "Othello with a bounded, cancellable AI opponent for Precursor"
+license = "Apache-2.0"
 
+# Lives at xous-core/apps/othello/ (see xous-dev-toolkit/bin/integrate).
+# The game engine is libs/othello-core in this repo; integrate copies it to xous-core/libs/.
 [dependencies]
-# Game engine (local library)
-othello-core = { path = "../../libs/othello-core", default-features = false }
-
-# Core Xous
-xous = "0.9.69"
-xous-ipc = "0.10.9"
 log = "0.4.14"
-log-server = { package = "xous-api-log", version = "0.1.68" }
-xous-names = { package = "xous-api-names", version = "0.9.70" }
-
-# Graphics (access via gam re-exports)
-gam = { path = "../../services/gam" }
-
-# Timing
-ticktimer-server = { package = "xous-api-ticktimer", version = "0.9.68" }
-
-# Storage
-pddb = { path = "../../services/pddb" }
-
-# Hardware (vibration, TRNG)
-llio = { path = "../../services/llio" }
-trng = { path = "../../services/trng" }
-
-# Enum serialization
 num-derive = { version = "0.4.2", default-features = false }
 num-traits = { version = "0.2.14", default-features = false }
+xous = "0.9.71"
+log-server = { package = "xous-api-log", version = "0.1.70" }
+xous-names = { package = "xous-api-names", version = "0.9.72" }
+gam = { path = "../../services/gam" }
+precursor-appkit = { path = "../../libs/precursor-appkit" }
+othello-core = { path = "../../libs/othello-core" }
+
+[features]
+default = []

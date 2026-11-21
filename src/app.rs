@@ -1,876 +1,787 @@
-//! Main application state and logic
+//! Screens, input and persistence for Othello. Rules, AI, match flow and save
+//! formats are in `othello-core`; this file maps keys to those operations,
+//! stores data, and draws.
 
-use gam::Gid;
-use gam::menu::Point;
-use othello_core::{GameState, GameResult, Player, Difficulty, find_best_move, pos};
+use gam::GlyphStyle;
+use othello_core::{
+    pos_to_algebraic, Difficulty, Match, Mode, Outcome, Player, PlayError, Settings, Stats, WhatIf,
+};
+use precursor_appkit::keys::Key;
+use precursor_appkit::layout::ListState;
+use precursor_appkit::rng::Trng;
+use precursor_appkit::screen::Screen;
+use precursor_appkit::store::Store;
 
-use crate::menu::{Menu, MenuItem, MenuContext};
-use crate::storage::{Settings, Statistics};
-use crate::ui;
-use crate::help::HelpContext;
-use crate::AppOp;
+use crate::ai::Worker;
+use crate::board_view::{self, Geometry};
 
-/// Game mode (vs CPU or two player)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GameMode {
-    VsCpu(Difficulty),
-    TwoPlayer,
+const KEY_SETTINGS: &str = "settings";
+const KEY_STATS: &str = "stats";
+const KEY_SAVE: &str = "save";
+
+#[derive(PartialEq, Eq)]
+pub enum Action {
+    Stay,
+    Leave,
 }
 
-/// Main application state
-#[derive(Debug, Clone)]
-pub enum AppState {
-    /// Main menu
-    MainMenu,
-    /// New game selection
-    NewGameMenu,
-    /// Settings screen
-    SettingsMenu,
-    /// Statistics display
-    Statistics,
-    /// Active game
-    Playing {
-        game: GameState,
-        mode: GameMode,
-        player_color: Player,
-        cursor_pos: (u8, u8),
-        ai_thinking: bool,
-        thinking_dots: u8,
-        show_pass_notice: bool,
-    },
-    /// Game over screen
-    GameOver {
-        game: GameState,
-        mode: GameMode,
-        player_color: Player,
-    },
-    /// What If review mode
-    WhatIf {
-        base_game: GameState,
-        current_game: GameState,
-        view_index: usize,
-        branched: bool,
-        cursor_pos: (u8, u8),
-    },
-    /// Move history view
-    MoveHistory {
-        game: GameState,
-        scroll_offset: usize,
-    },
-    /// Help screen
-    Help {
-        context: HelpContext,
-        previous: Box<AppState>,
-    },
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum View {
+    Main,
+    NewGame,
+    Settings,
+    Stats,
+    Help,
+    Playing,
+    GameMenu,
+    GameOver,
+    WhatIf,
+    History,
 }
 
-/// Main Othello app
-pub struct OthelloApp {
-    /// Graphics ID for drawing
-    pub gid: Gid,
-    /// Screen dimensions
-    pub screensize: Point,
-    /// Current application state
-    pub state: AppState,
-    /// Context menu
-    pub menu: Menu,
-    /// User settings
-    pub settings: Settings,
-    /// Game statistics
-    pub stats: Statistics,
-    /// Whether we have a saved game
-    pub has_save: bool,
-    /// Whether the app should quit
-    pub should_quit: bool,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Busy {
+    Cpu,
+    Hint,
 }
 
-impl OthelloApp {
-    /// Create a new app
-    pub fn new(gid: Gid, screensize: Point) -> Self {
-        Self {
-            gid,
-            screensize,
-            state: AppState::MainMenu,
-            menu: Menu::new(),
+/// A stored blob that failed to parse is kept as is, and never overwritten.
+#[derive(Default)]
+struct ReadOnly {
+    settings: bool,
+    stats: bool,
+    save: bool,
+}
+
+pub struct App {
+    screen: Screen,
+    store: Store,
+    trng: Trng,
+    ai: Worker,
+    view: View,
+    /// Where Help / History return to.
+    return_to: View,
+    list: ListState,
+    visible_rows: usize,
+    settings: Settings,
+    stats: Stats,
+    ro: ReadOnly,
+    has_save: bool,
+    m: Option<Match>,
+    cursor: (u8, u8),
+    busy: Option<Busy>,
+    what_if: Option<WhatIf>,
+    save_dirty: bool,
+    notice: String,
+}
+
+const MAIN_ITEMS: [&str; 6] = ["New game", "Resume game", "Statistics", "Settings", "Help", "Quit"];
+const LEVELS: [(&str, Mode); 5] = [
+    ("1  Easy", Mode::VsCpu(Difficulty::Easy)),
+    ("2  Medium", Mode::VsCpu(Difficulty::Medium)),
+    ("3  Hard", Mode::VsCpu(Difficulty::Hard)),
+    ("4  Expert", Mode::VsCpu(Difficulty::Expert)),
+    ("5  Two players", Mode::TwoPlayer),
+];
+const GAME_MENU: [&str; 7] =
+    ["Back to game", "Hint", "Undo", "Move history", "Resign", "Save & exit", "Help"];
+
+const HELP_TEXT: &str = "Outflank your opponent's discs to flip them. \
+Most discs when neither side can move wins. A side with no legal move passes automatically.\n\
+In the game: arrows move the cursor, Enter places a disc, F1 menu, F2 hint, U undo, \
+Backspace/F4 saves and leaves the game. Dots mark legal moves.\n\
+Against the CPU your colour is chosen at random; Black moves first. \
+After a game, W reviews it and lets you try other moves (F2/F3 step).\n\
+The CPU searches on a background thread with a time limit, so higher levels may play \
+weaker than their label when the device is slow.";
+
+fn name(p: Player) -> &'static str {
+    match p {
+        Player::Black => "Black",
+        Player::White => "White",
+    }
+}
+
+fn mode_name(m: Mode) -> &'static str {
+    match m {
+        Mode::VsCpu(Difficulty::Easy) => "Easy",
+        Mode::VsCpu(Difficulty::Medium) => "Medium",
+        Mode::VsCpu(Difficulty::Hard) => "Hard",
+        Mode::VsCpu(Difficulty::Expert) => "Expert",
+        Mode::TwoPlayer => "Two players",
+    }
+}
+
+fn sq(p: u8) -> String {
+    let [c, r] = pos_to_algebraic(p);
+    format!("{}{}", c as char, r as char)
+}
+
+impl App {
+    pub fn new(screen: Screen, store: Store, trng: Trng, ai: Worker) -> Self {
+        let mut app = Self {
+            screen,
+            store,
+            trng,
+            ai,
+            view: View::Main,
+            return_to: View::Main,
+            list: ListState::default(),
+            visible_rows: 6,
             settings: Settings::default(),
-            stats: Statistics::default(),
+            stats: Stats::default(),
+            ro: ReadOnly::default(),
             has_save: false,
-            should_quit: false,
-        }
+            m: None,
+            cursor: (3, 3),
+            busy: None,
+            what_if: None,
+            save_dirty: false,
+            notice: String::new(),
+        };
+        app.reload();
+        app
     }
 
-    /// Load settings from PDDB
-    pub fn load_settings(&mut self) {
-        if let Some(settings) = crate::storage::load_settings() {
-            self.settings = settings;
-        }
-        if let Some(stats) = crate::storage::load_statistics() {
-            self.stats = stats;
-        }
-        self.has_save = crate::storage::has_saved_game();
-    }
+    pub fn screen(&self) -> &Screen { &self.screen }
 
-    /// Save settings to PDDB
-    pub fn save_settings(&self) {
-        crate::storage::save_settings(&self.settings);
-    }
-
-    /// Handle going to background
-    pub fn on_background(&mut self) {
-        // Pause AI thinking if active
-        if let AppState::Playing { ai_thinking, .. } = &mut self.state {
-            *ai_thinking = false;
-        }
-    }
-
-    /// Handle returning to foreground
-    pub fn on_foreground(&mut self) {
-        // Resume AI if it was their turn
-        self.check_ai_turn();
-    }
-
-    /// Draw the current state
-    pub fn draw(&self, gam: &gam::Gam) {
-        ui::draw(self, gam);
-
-        // Draw menu overlay if visible
-        if self.menu.visible {
-            ui::draw_menu(self, gam);
-        }
-    }
-
-    /// Handle a key press
-    pub fn handle_key(
-        &mut self,
-        key: char,
-        gam: &gam::Gam,
-        ticktimer: &ticktimer_server::Ticktimer,
-        self_cid: xous::CID,
-    ) -> bool {
-        // Handle menu if visible
-        if self.menu.visible {
-            return self.handle_menu_key(key, gam, ticktimer, self_cid);
-        }
-
-        // Handle F-keys first
-        match key {
-            '\u{F001}' | '\u{0091}' => {
-                // F1 - Open menu
-                self.open_context_menu();
-                return true;
+    /// (Re)load settings, statistics and the save marker. Runs at start and
+    /// whenever the set of open PDDB bases changes. A game in progress is kept.
+    pub fn reload(&mut self) {
+        self.ro = ReadOnly::default();
+        match self.store.read_bytes(KEY_SETTINGS) {
+            Ok(Some(b)) => match Settings::decode(&b) {
+                Some(s) => self.settings = s,
+                None => {
+                    self.ro.settings = true;
+                    self.settings = Settings::default();
+                }
+            },
+            Ok(None) => self.settings = Settings::default(),
+            Err(e) => {
+                log::error!("settings read failed: {:?}", e);
+                self.ro.settings = true;
             }
-            '\u{F004}' | '\u{0094}' => {
-                // F4 - Exit/Back
-                return self.handle_f4(gam, ticktimer);
+        }
+        match self.store.read_bytes(KEY_STATS) {
+            Ok(Some(b)) => match Stats::decode(&b) {
+                Some(s) => self.stats = s,
+                None => {
+                    self.ro.stats = true;
+                    self.stats = Stats::default();
+                }
+            },
+            Ok(None) => self.stats = Stats::default(),
+            Err(e) => {
+                log::error!("stats read failed: {:?}", e);
+                self.ro.stats = true;
+            }
+        }
+        match self.store.read_bytes(KEY_SAVE) {
+            Ok(Some(b)) => {
+                self.has_save = true;
+                if Match::decode(&b).is_err() {
+                    self.ro.save = true;
+                }
+            }
+            Ok(None) => self.has_save = false,
+            Err(e) => {
+                log::error!("save read failed: {:?}", e);
+                self.has_save = false;
+                self.ro.save = true;
+            }
+        }
+        if self.ro.settings || self.ro.stats || self.ro.save {
+            self.notice = "Some saved data is unreadable and was left untouched".into();
+        }
+        self.draw();
+    }
+
+    // ---- persistence -------------------------------------------------------
+
+    fn save_settings(&mut self) {
+        if self.ro.settings {
+            self.notice = "Settings are read-only (unreadable data)".into();
+            return;
+        }
+        if let Err(e) = self.store.write_bytes(KEY_SETTINGS, &self.settings.encode()) {
+            log::error!("settings save failed: {:?}", e);
+            self.notice = "Couldn't save settings".into();
+        }
+    }
+
+    fn save_stats(&mut self) {
+        if self.ro.stats {
+            return;
+        }
+        if let Err(e) = self.store.write_bytes(KEY_STATS, &self.stats.encode()) {
+            log::error!("stats save failed: {:?}", e);
+            self.notice = "Couldn't save statistics".into();
+        }
+    }
+
+    /// Save the game in progress, only if something changed.
+    fn save_game(&mut self) {
+        if !self.save_dirty {
+            return;
+        }
+        let Some(m) = self.m.as_ref().filter(|m| !m.is_over()) else { return };
+        if self.ro.save {
+            self.notice = "Existing save is unreadable; not overwritten".into();
+            return;
+        }
+        match self.store.write_bytes(KEY_SAVE, &m.encode()) {
+            Ok(()) => {
+                self.save_dirty = false;
+                self.has_save = true;
+            }
+            Err(e) => {
+                log::error!("game save failed: {:?}", e);
+                self.notice = "Couldn't save the game".into();
+            }
+        }
+    }
+
+    fn delete_save(&mut self) {
+        if self.has_save && !self.ro.save {
+            if let Err(e) = self.store.delete(KEY_SAVE) {
+                log::error!("save delete failed: {:?}", e);
+            }
+            self.has_save = false;
+        }
+        self.save_dirty = false;
+    }
+
+    // ---- game flow ---------------------------------------------------------
+
+    fn start_game(&mut self, mode: Mode) {
+        let human = if self.trng.below(2) == 0 { Player::Black } else { Player::White };
+        self.m = Some(Match::new(mode, human));
+        self.cursor = (3, 3);
+        self.notice.clear();
+        self.view = View::Playing;
+        self.save_dirty = true;
+        self.maybe_start_cpu();
+    }
+
+    fn resume_game(&mut self) {
+        let loaded = match self.store.read_bytes(KEY_SAVE) {
+            Ok(Some(b)) => Match::decode(&b).map_err(|e| format!("Saved game unreadable ({e:?})")),
+            Ok(None) => Err("No saved game".to_string()),
+            Err(_) => Err("Couldn't read the saved game".to_string()),
+        };
+        match loaded {
+            Ok(m) if !m.is_over() => {
+                self.m = Some(m);
+                self.cursor = (3, 3);
+                self.notice.clear();
+                self.view = View::Playing;
+                self.save_dirty = false;
+                self.maybe_start_cpu();
+            }
+            Ok(_) => {
+                self.delete_save();
+                self.notice = "Saved game was already finished".into();
+            }
+            Err(msg) => {
+                self.ro.save = true;
+                self.notice = msg;
+            }
+        }
+    }
+
+    fn maybe_start_cpu(&mut self) {
+        let Some(m) = self.m.as_ref() else { return };
+        if m.cpu_to_move() {
+            if let Mode::VsCpu(d) = m.mode() {
+                self.busy = Some(Busy::Cpu);
+                self.ai.start(*m.game().board(), m.game().current_player(), d, false);
+            }
+        }
+    }
+
+    fn start_hint(&mut self) {
+        let Some(m) = self.m.as_ref() else { return };
+        if self.busy.is_none() && m.human_to_move() {
+            self.busy = Some(Busy::Hint);
+            self.ai.start(*m.game().board(), m.game().current_player(), Difficulty::Hard, true);
+        }
+    }
+
+    /// Worker result: `pos` is a square, or 255 for "no move".
+    pub fn on_ai_done(&mut self, pos: usize, generation: usize, hint: bool) {
+        if !self.ai.is_current(generation) {
+            return;
+        }
+        let busy = self.busy.take();
+        if self.view != View::Playing {
+            return;
+        }
+        match (busy, hint) {
+            (Some(Busy::Hint), true) => {
+                if pos < 64 {
+                    self.cursor = ((pos / 8) as u8, (pos % 8) as u8);
+                    self.notice = format!("Hint: {}", sq(pos as u8));
+                }
+            }
+            (Some(Busy::Cpu), false) => {
+                let Some(m) = self.m.as_mut() else { return };
+                // The worker only fails to answer if it couldn't start; fall back to any legal move.
+                let choice = if pos < 64 {
+                    pos as u8
+                } else {
+                    m.game().legal_moves_bitboard().trailing_zeros() as u8
+                };
+                match m.play_cpu(choice) {
+                    Ok(passed) => self.after_move(passed),
+                    Err(e) => {
+                        log::error!("CPU move rejected: {:?}", e);
+                        self.notice = "CPU move failed".into();
+                    }
+                }
             }
             _ => {}
         }
-
-        // State-specific key handling
-        match &mut self.state {
-            AppState::MainMenu => self.handle_main_menu_key(key),
-            AppState::NewGameMenu => self.handle_new_game_menu_key(key, self_cid),
-            AppState::SettingsMenu => self.handle_settings_menu_key(key),
-            AppState::Statistics => self.handle_statistics_key(key),
-            AppState::Playing { .. } => self.handle_playing_key(key, self_cid),
-            AppState::GameOver { .. } => self.handle_game_over_key(key, self_cid),
-            AppState::WhatIf { .. } => self.handle_what_if_key(key),
-            AppState::MoveHistory { .. } => self.handle_history_key(key),
-            AppState::Help { .. } => self.handle_help_key(key),
-        }
     }
 
-    /// Handle F4 (Exit/Back)
-    fn handle_f4(
-        &mut self,
-        _gam: &gam::Gam,
-        _ticktimer: &ticktimer_server::Ticktimer,
-    ) -> bool {
-        match &self.state {
-            AppState::MainMenu => {
-                // Exit the app
-                self.should_quit = true;
-                false
-            }
-            AppState::NewGameMenu | AppState::SettingsMenu | AppState::Statistics => {
-                self.state = AppState::MainMenu;
-                true
-            }
-            AppState::Playing { game, mode, player_color, .. } => {
-                // Save game and go to main menu
-                crate::storage::save_game(game, *mode, *player_color);
-                self.has_save = true;
-                self.state = AppState::MainMenu;
-                true
-            }
-            AppState::GameOver { .. } => {
-                self.state = AppState::MainMenu;
-                true
-            }
-            AppState::WhatIf { .. } => {
-                // Exit What If mode
-                self.state = AppState::MainMenu;
-                true
-            }
-            AppState::MoveHistory { .. } => {
-                // Return to previous state (game over or playing)
-                self.state = AppState::MainMenu;
-                true
-            }
-            AppState::Help { previous, .. } => {
-                self.state = *previous.clone();
-                true
-            }
-        }
-    }
-
-    /// Open the context menu for current state
-    fn open_context_menu(&mut self) {
-        let context = match &self.state {
-            AppState::MainMenu => MenuContext::MainMenu { has_save: self.has_save },
-            AppState::Playing { .. } => MenuContext::Playing,
-            AppState::GameOver { .. } => MenuContext::GameOver,
-            AppState::WhatIf { .. } => MenuContext::WhatIf,
-            _ => return, // No menu for other states
-        };
-        self.menu.open(context);
-    }
-
-    /// Handle key in menu
-    fn handle_menu_key(
-        &mut self,
-        key: char,
-        _gam: &gam::Gam,
-        _ticktimer: &ticktimer_server::Ticktimer,
-        self_cid: xous::CID,
-    ) -> bool {
-        match key {
-            '\u{F004}' | '\u{0094}' | '\u{001B}' => {
-                // F4 or Esc - Close menu
-                self.menu.close();
-                true
-            }
-            '↑' | '\u{2191}' => {
-                self.menu.up();
-                true
-            }
-            '↓' | '\u{2193}' => {
-                self.menu.down();
-                true
-            }
-            '\r' | '\n' => {
-                // Select
-                if let Some(item) = self.menu.select() {
-                    self.handle_menu_action(item, self_cid);
-                }
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Handle a menu action
-    fn handle_menu_action(&mut self, item: MenuItem, self_cid: xous::CID) {
-        self.menu.close();
-
-        match item {
-            MenuItem::Help => {
-                let context = match &self.state {
-                    AppState::Playing { .. } => HelpContext::Playing,
-                    AppState::WhatIf { .. } => HelpContext::WhatIf,
-                    _ => HelpContext::MainMenu,
-                };
-                let previous = Box::new(self.state.clone());
-                self.state = AppState::Help { context, previous };
-            }
-            MenuItem::NewGame => {
-                self.state = AppState::NewGameMenu;
-            }
-            MenuItem::Resume => {
-                if let Some((game, mode, player_color)) = crate::storage::load_game() {
-                    self.state = AppState::Playing {
-                        game,
-                        mode,
-                        player_color,
-                        cursor_pos: (3, 3),
-                        ai_thinking: false,
-                        thinking_dots: 0,
-                        show_pass_notice: false,
-                    };
-                    self.check_ai_turn();
-                }
-            }
-            MenuItem::Statistics => {
-                self.state = AppState::Statistics;
-            }
-            MenuItem::Settings => {
-                self.state = AppState::SettingsMenu;
-            }
-            MenuItem::MoveHistory => {
-                if let AppState::Playing { game, .. } | AppState::GameOver { game, .. } = &self.state {
-                    self.state = AppState::MoveHistory {
-                        game: game.clone(),
-                        scroll_offset: 0,
-                    };
-                }
-            }
-            MenuItem::Hint => {
-                if let AppState::Playing { game, cursor_pos, .. } = &mut self.state {
-                    if let Some(pos) = othello_core::get_hint(game.board(), game.current_player()) {
-                        let (row, col) = othello_core::pos_to_rc(pos);
-                        *cursor_pos = (row, col);
-                    }
-                }
-            }
-            MenuItem::Undo => {
-                if let AppState::Playing { game, .. } = &mut self.state {
-                    game.undo();
-                    // In vs CPU mode, undo opponent's move too
-                    game.undo();
-                }
-            }
-            MenuItem::Resign => {
-                // Extract values before mutating
-                let data = if let AppState::Playing { game, mode, player_color, .. } = &self.state {
-                    Some((game.clone(), *mode, *player_color))
-                } else {
-                    None
-                };
-                if let Some((game_clone, mode_copy, player_copy)) = data {
-                    // Record loss and go to game over
-                    self.update_stats_loss(mode_copy);
-                    self.state = AppState::GameOver {
-                        game: game_clone,
-                        mode: mode_copy,
-                        player_color: player_copy,
-                    };
-                }
-            }
-            MenuItem::SaveAndExit => {
-                if let AppState::Playing { game, mode, player_color, .. } = &self.state {
-                    crate::storage::save_game(game, *mode, *player_color);
-                    self.has_save = true;
-                    self.state = AppState::MainMenu;
-                }
-            }
-            MenuItem::WhatIf => {
-                if let AppState::GameOver { game, .. } = &self.state {
-                    self.state = AppState::WhatIf {
-                        base_game: game.clone(),
-                        current_game: game.clone(),
-                        view_index: game.move_count(),
-                        branched: false,
-                        cursor_pos: (3, 3),
-                    };
-                }
-            }
-            MenuItem::ExitWhatIf => {
-                self.state = AppState::MainMenu;
-            }
-            MenuItem::MainMenu => {
-                self.state = AppState::MainMenu;
-            }
-        }
-    }
-
-    /// Handle key in main menu
-    fn handle_main_menu_key(&mut self, key: char) -> bool {
-        match key {
-            '↑' | '\u{2191}' | '↓' | '\u{2193}' | '\r' | '\n' => {
-                // Main menu uses F1 menu system
-                self.open_context_menu();
-                true
-            }
-            'n' | 'N' => {
-                self.state = AppState::NewGameMenu;
-                true
-            }
-            's' | 'S' => {
-                self.state = AppState::SettingsMenu;
-                true
-            }
-            'q' | 'Q' => {
-                self.should_quit = true;
-                false
-            }
-            _ => false,
-        }
-    }
-
-    /// Handle key in new game menu
-    fn handle_new_game_menu_key(&mut self, key: char, self_cid: xous::CID) -> bool {
-        match key {
-            '1' => {
-                self.start_game(GameMode::VsCpu(Difficulty::Easy), self_cid);
-                true
-            }
-            '2' => {
-                self.start_game(GameMode::VsCpu(Difficulty::Medium), self_cid);
-                true
-            }
-            '3' => {
-                self.start_game(GameMode::VsCpu(Difficulty::Hard), self_cid);
-                true
-            }
-            '4' => {
-                self.start_game(GameMode::VsCpu(Difficulty::Expert), self_cid);
-                true
-            }
-            '5' | 't' | 'T' => {
-                self.start_game(GameMode::TwoPlayer, self_cid);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Start a new game
-    fn start_game(&mut self, mode: GameMode, _self_cid: xous::CID) {
-        let game = GameState::new();
-
-        // Random player color for vs CPU
-        let player_color = match mode {
-            GameMode::VsCpu(_) => {
-                // Use hardware TRNG
-                if crate::feedback::random_bit() {
-                    Player::Black
-                } else {
-                    Player::White
-                }
-            }
-            GameMode::TwoPlayer => Player::Black, // Not used in two-player
-        };
-
-        self.state = AppState::Playing {
-            game,
-            mode,
-            player_color,
-            cursor_pos: (3, 3),
-            ai_thinking: false,
-            thinking_dots: 0,
-            show_pass_notice: false,
-        };
-
-        // Start AI if it goes first
-        self.check_ai_turn();
-    }
-
-    /// Check if it's the AI's turn and start thinking
-    fn check_ai_turn(&mut self) {
-        if let AppState::Playing { game, mode, player_color, ai_thinking, .. } = &mut self.state {
-            if let GameMode::VsCpu(_) = mode {
-                if game.current_player() != *player_color && !game.is_game_over() {
-                    *ai_thinking = true;
-                }
-            }
-        }
-    }
-
-    /// Handle key while playing
-    fn handle_playing_key(&mut self, key: char, _self_cid: xous::CID) -> bool {
-        // Get mutable access to playing state
-        let (game, mode, player_color, cursor_pos, ai_thinking, show_pass_notice) = match &mut self.state {
-            AppState::Playing {
-                game,
-                mode,
-                player_color,
-                cursor_pos,
-                ai_thinking,
-                show_pass_notice,
-                ..
-            } => (game, mode, player_color, cursor_pos, ai_thinking, show_pass_notice),
-            _ => return false,
-        };
-
-        // If AI is thinking, ignore most keys
-        if *ai_thinking {
-            return false;
-        }
-
-        // If showing pass notice, any key dismisses
-        if *show_pass_notice {
-            *show_pass_notice = false;
-            return true;
-        }
-
-        match key {
-            // Arrow keys for cursor movement
-            '↑' | '\u{2191}' => {
-                if cursor_pos.0 > 0 {
-                    cursor_pos.0 -= 1;
-                }
-                true
-            }
-            '↓' | '\u{2193}' => {
-                if cursor_pos.0 < 7 {
-                    cursor_pos.0 += 1;
-                }
-                true
-            }
-            '←' | '\u{2190}' => {
-                if cursor_pos.1 > 0 {
-                    cursor_pos.1 -= 1;
-                }
-                true
-            }
-            '→' | '\u{2192}' => {
-                if cursor_pos.1 < 7 {
-                    cursor_pos.1 += 1;
-                }
-                true
-            }
-            // Enter to place disc
-            '\r' | '\n' => {
-                let position = pos(cursor_pos.0, cursor_pos.1);
-                if game.is_legal(position) {
-                    game.make_move(position);
-                    crate::feedback::vibrate_move();
-
-                    // Check for game over
-                    if game.is_game_over() {
-                        self.handle_game_over();
-                        return true;
-                    }
-
-                    // Check if opponent must pass
-                    if !game.has_moves() {
-                        game.pass();
-                        *show_pass_notice = true;
-
-                        // Check if now we must pass (game over)
-                        if !game.has_moves() {
-                            game.pass();
-                            if game.is_game_over() {
-                                self.handle_game_over();
-                                return true;
-                            }
-                        }
-                    }
-
-                    // Start AI thinking
-                    self.check_ai_turn();
-                    true
-                } else {
-                    crate::feedback::vibrate_invalid();
-                    false
-                }
-            }
-            // F2 for hint
-            '\u{F002}' | '\u{0092}' => {
-                if let Some(pos) = othello_core::get_hint(game.board(), game.current_player()) {
-                    let (row, col) = othello_core::pos_to_rc(pos);
-                    *cursor_pos = (row, col);
-                }
-                true
-            }
-            // U for undo
-            'u' | 'U' => {
-                if self.settings.allow_undo {
-                    game.undo();
-                    if matches!(mode, GameMode::VsCpu(_)) {
-                        game.undo(); // Undo AI move too
-                    }
-                }
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Handle game over transition
-    fn handle_game_over(&mut self) {
-        // Extract values before mutating
-        let data = if let AppState::Playing { game, mode, player_color, .. } = &self.state {
-            let result = game.result();
-            let winner = result.as_ref().and_then(|r| r.winner());
-            Some((game.clone(), *mode, *player_color, winner))
+    fn after_move(&mut self, passed: Option<Player>) {
+        self.save_dirty = true;
+        self.notice = passed.map(|p| format!("{} has no move and passes", name(p))).unwrap_or_default();
+        if self.m.as_ref().is_some_and(|m| m.is_over()) {
+            self.finish_game();
         } else {
-            None
+            self.maybe_start_cpu();
+        }
+    }
+
+    /// One path for every way a game ends (last move, double pass, resign).
+    fn finish_game(&mut self) {
+        self.ai.cancel();
+        self.busy = None;
+        let Some(m) = self.m.as_ref() else { return };
+        self.stats.record(m.mode(), m.outcome());
+        self.save_stats();
+        self.delete_save();
+        self.view = View::GameOver;
+    }
+
+    fn leave_game_to_main(&mut self) {
+        self.ai.cancel();
+        self.busy = None;
+        self.save_game();
+        self.view = View::Main;
+        self.list = ListState::default();
+    }
+
+    // ---- lifecycle ---------------------------------------------------------
+
+    pub fn on_foreground(&mut self) {
+        self.screen.refresh_size();
+        if self.view == View::Playing {
+            self.maybe_start_cpu();
+        }
+        self.draw();
+    }
+
+    /// Stop the search, save the game if it changed.
+    pub fn on_background(&mut self) {
+        self.ai.cancel();
+        self.busy = None;
+        self.save_game();
+    }
+
+    // ---- input -------------------------------------------------------------
+
+    fn main_items(&self) -> Vec<&'static str> {
+        MAIN_ITEMS.iter().copied().filter(|s| *s != "Resume game" || self.has_save).collect()
+    }
+
+    pub fn on_key(&mut self, key: Key) -> Action {
+        if !matches!(self.view, View::Playing) {
+            self.notice.clear();
+        }
+        match self.view {
+            View::Main => return self.key_main(key),
+            View::NewGame => self.key_new_game(key),
+            View::Settings => self.key_settings(key),
+            View::Stats | View::Help => {
+                if key.is_back() || key.is_select() {
+                    self.view = if self.view == View::Help { self.return_to } else { View::Main };
+                }
+            }
+            View::Playing => self.key_playing(key),
+            View::GameMenu => self.key_game_menu(key),
+            View::GameOver => self.key_game_over(key),
+            View::WhatIf => self.key_what_if(key),
+            View::History => self.key_history(key),
+        }
+        Action::Stay
+    }
+
+    fn move_list(&mut self, key: Key, len: usize) {
+        match key {
+            Key::Up => self.list.step(-1, len, self.visible_rows),
+            Key::Down => self.list.step(1, len, self.visible_rows),
+            _ => {}
+        }
+    }
+
+    fn key_main(&mut self, key: Key) -> Action {
+        let items = self.main_items();
+        self.move_list(key, items.len());
+        if key.is_back() {
+            return Action::Leave;
+        }
+        if key.is_select() {
+            match items[self.list.selected.min(items.len() - 1)] {
+                "New game" => {
+                    self.view = View::NewGame;
+                    self.list = ListState::default();
+                }
+                "Resume game" => self.resume_game(),
+                "Statistics" => self.view = View::Stats,
+                "Settings" => {
+                    self.view = View::Settings;
+                    self.list = ListState::default();
+                }
+                "Help" => {
+                    self.return_to = View::Main;
+                    self.view = View::Help;
+                }
+                _ => return Action::Leave,
+            }
+        }
+        Action::Stay
+    }
+
+    fn key_new_game(&mut self, key: Key) {
+        self.move_list(key, LEVELS.len());
+        if key.is_back() {
+            self.view = View::Main;
+            self.list = ListState::default();
+        } else if key.is_select() {
+            self.start_game(LEVELS[self.list.selected].1);
+        } else if let Key::Char(c @ '1'..='5') = key {
+            self.start_game(LEVELS[c as usize - '1' as usize].1);
+        }
+    }
+
+    fn key_settings(&mut self, key: Key) {
+        self.move_list(key, 3);
+        if key.is_back() {
+            self.view = View::Main;
+            self.list = ListState::default();
+        } else if key.is_select() || matches!(key, Key::Left | Key::Right) {
+            match self.list.selected {
+                0 => self.settings.show_coordinates = !self.settings.show_coordinates,
+                1 => self.settings.show_valid_moves = !self.settings.show_valid_moves,
+                _ => self.settings.allow_undo = !self.settings.allow_undo,
+            }
+            self.save_settings();
+        }
+    }
+
+    fn key_playing(&mut self, key: Key) {
+        // Cursor movement is always allowed, even while the CPU thinks.
+        match key {
+            Key::Up => self.cursor.0 = self.cursor.0.saturating_sub(1),
+            Key::Down => self.cursor.0 = (self.cursor.0 + 1).min(7),
+            Key::Left => self.cursor.1 = self.cursor.1.saturating_sub(1),
+            Key::Right => self.cursor.1 = (self.cursor.1 + 1).min(7),
+            k if k.is_back() => self.leave_game_to_main(),
+            _ if self.busy == Some(Busy::Cpu) => {}
+            Key::F(1) => {
+                self.view = View::GameMenu;
+                self.list = ListState::default();
+            }
+            Key::F(2) => {
+                self.notice.clear();
+                self.start_hint();
+            }
+            Key::Char('u') | Key::Char('U') => self.undo(),
+            Key::Enter => self.place(),
+            _ => {}
+        }
+    }
+
+    fn place(&mut self) {
+        self.notice.clear();
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(m) = self.m.as_mut() else { return };
+        let pos = self.cursor.0 * 8 + self.cursor.1;
+        match m.play(pos) {
+            Ok(passed) => self.after_move(passed),
+            Err(PlayError::Illegal) => self.notice = "Not a legal move".into(),
+            Err(PlayError::NotYourTurn) => {}
+        }
+    }
+
+    fn undo(&mut self) {
+        if !self.settings.allow_undo {
+            self.notice = "Undo is turned off in Settings".into();
+            return;
+        }
+        let Some(m) = self.m.as_mut() else { return };
+        self.ai.cancel();
+        self.busy = None;
+        if m.undo() {
+            self.save_dirty = true;
+            self.notice = "Undone".into();
+            self.maybe_start_cpu(); // human is White and the CPU's opening was undone
+        } else {
+            self.notice = "Nothing to undo".into();
+        }
+    }
+
+    fn key_game_menu(&mut self, key: Key) {
+        self.move_list(key, GAME_MENU.len());
+        if key.is_back() {
+            self.view = View::Playing;
+        } else if key.is_select() {
+            self.view = View::Playing;
+            match self.list.selected {
+                1 => self.start_hint(),
+                2 => self.undo(),
+                3 => {
+                    self.return_to = View::Playing;
+                    self.view = View::History;
+                    self.list = ListState::default();
+                }
+                4 => {
+                    if let Some(m) = self.m.as_mut() {
+                        m.resign();
+                    }
+                    self.finish_game();
+                }
+                5 => self.leave_game_to_main(),
+                6 => {
+                    self.return_to = View::Playing;
+                    self.view = View::Help;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn key_game_over(&mut self, key: Key) {
+        match key {
+            k if k.is_back() => {
+                self.view = View::Main;
+                self.list = ListState::default();
+            }
+            Key::Enter => {
+                if let Some(mode) = self.m.as_ref().map(|m| m.mode()) {
+                    self.start_game(mode);
+                }
+            }
+            Key::Char('n') | Key::Char('N') => {
+                self.view = View::NewGame;
+                self.list = ListState::default();
+            }
+            Key::Char('w') | Key::Char('W') => {
+                if let Some(m) = self.m.as_ref() {
+                    self.what_if = Some(WhatIf::new(m.game().clone()));
+                    self.cursor = (3, 3);
+                    self.view = View::WhatIf;
+                }
+            }
+            Key::Char('h') | Key::Char('H') => {
+                self.return_to = View::GameOver;
+                self.view = View::History;
+                self.list = ListState::default();
+            }
+            _ => {}
+        }
+    }
+
+    fn key_what_if(&mut self, key: Key) {
+        let Some(w) = self.what_if.as_mut() else {
+            self.view = View::GameOver;
+            return;
         };
-
-        if let Some((game_clone, mode_copy, player_color_copy, winner)) = data {
-            // Update statistics
-            match mode_copy {
-                GameMode::VsCpu(_) => {
-                    match winner {
-                        Some(w) if w == player_color_copy => {
-                            self.update_stats_win(mode_copy);
-                        }
-                        Some(_) => {
-                            self.update_stats_loss(mode_copy);
-                        }
-                        None => {
-                            self.update_stats_draw(mode_copy);
-                        }
-                    }
-                }
-                GameMode::TwoPlayer => {
-                    self.stats.two_player_games += 1;
-                }
-            }
-
-            crate::storage::save_statistics(&self.stats);
-            crate::feedback::vibrate_game_over();
-
-            // Clear saved game
-            crate::storage::delete_saved_game();
-            self.has_save = false;
-
-            self.state = AppState::GameOver {
-                game: game_clone,
-                mode: mode_copy,
-                player_color: player_color_copy,
-            };
-        }
-    }
-
-    /// Update stats for a win
-    fn update_stats_win(&mut self, mode: GameMode) {
-        match mode {
-            GameMode::VsCpu(Difficulty::Easy) => self.stats.easy_wins += 1,
-            GameMode::VsCpu(Difficulty::Medium) => self.stats.medium_wins += 1,
-            GameMode::VsCpu(Difficulty::Hard) => self.stats.hard_wins += 1,
-            GameMode::VsCpu(Difficulty::Expert) => self.stats.expert_wins += 1,
-            GameMode::TwoPlayer => self.stats.two_player_games += 1,
-        }
-    }
-
-    /// Update stats for a loss
-    fn update_stats_loss(&mut self, mode: GameMode) {
-        match mode {
-            GameMode::VsCpu(Difficulty::Easy) => self.stats.easy_losses += 1,
-            GameMode::VsCpu(Difficulty::Medium) => self.stats.medium_losses += 1,
-            GameMode::VsCpu(Difficulty::Hard) => self.stats.hard_losses += 1,
-            GameMode::VsCpu(Difficulty::Expert) => self.stats.expert_losses += 1,
-            GameMode::TwoPlayer => self.stats.two_player_games += 1,
-        }
-    }
-
-    /// Update stats for a draw
-    fn update_stats_draw(&mut self, mode: GameMode) {
-        match mode {
-            GameMode::VsCpu(Difficulty::Easy) => self.stats.easy_draws += 1,
-            GameMode::VsCpu(Difficulty::Medium) => self.stats.medium_draws += 1,
-            GameMode::VsCpu(Difficulty::Hard) => self.stats.hard_draws += 1,
-            GameMode::VsCpu(Difficulty::Expert) => self.stats.expert_draws += 1,
-            GameMode::TwoPlayer => self.stats.two_player_games += 1,
-        }
-    }
-
-    /// Handle key in game over state
-    fn handle_game_over_key(&mut self, key: char, self_cid: xous::CID) -> bool {
         match key {
-            '\r' | '\n' => {
-                // New game with same mode
-                if let AppState::GameOver { mode, .. } = self.state {
-                    self.start_game(mode, self_cid);
+            Key::Up => self.cursor.0 = self.cursor.0.saturating_sub(1),
+            Key::Down => self.cursor.0 = (self.cursor.0 + 1).min(7),
+            Key::Left => self.cursor.1 = self.cursor.1.saturating_sub(1),
+            Key::Right => self.cursor.1 = (self.cursor.1 + 1).min(7),
+            Key::F(2) | Key::Char(',') => w.step_back(),
+            Key::F(3) | Key::Char('.') => w.step_forward(),
+            Key::Enter => {
+                if !w.play(self.cursor.0 * 8 + self.cursor.1) {
+                    self.notice = "Not a legal move".into();
                 }
-                true
             }
-            'w' | 'W' => {
-                // Enter What If mode
-                if let AppState::GameOver { game, .. } = &self.state {
-                    self.state = AppState::WhatIf {
-                        base_game: game.clone(),
-                        current_game: game.clone(),
-                        view_index: game.move_count(),
-                        branched: false,
-                        cursor_pos: (3, 3),
-                    };
-                }
-                true
+            k if k.is_back() => {
+                self.what_if = None;
+                self.view = View::GameOver;
             }
-            'n' | 'N' => {
-                self.state = AppState::NewGameMenu;
-                true
-            }
-            _ => false,
+            _ => {}
         }
     }
 
-    /// Handle key in What If mode
-    fn handle_what_if_key(&mut self, key: char) -> bool {
-        let (base_game, current_game, view_index, branched, cursor_pos) = match &mut self.state {
-            AppState::WhatIf {
-                base_game,
-                current_game,
-                view_index,
-                branched,
-                cursor_pos,
-            } => (base_game, current_game, view_index, branched, cursor_pos),
-            _ => return false,
+    fn history_lines(&self) -> Vec<String> {
+        let Some(m) = self.m.as_ref() else { return Vec::new() };
+        let mut lines = Vec::new();
+        let mut n = 0;
+        for e in m.game().history() {
+            n += 1;
+            let mv = if e.is_pass() { "pass".to_string() } else { sq(e.pos) };
+            lines.push(format!("{:>2}. {} {}", n, name(e.player), mv));
+        }
+        if lines.is_empty() {
+            lines.push("No moves yet".into());
+        }
+        lines
+    }
+
+    fn key_history(&mut self, key: Key) {
+        let len = self.history_lines().len();
+        self.move_list(key, len);
+        if key.is_back() {
+            self.view = self.return_to;
+        }
+    }
+
+    // ---- drawing -----------------------------------------------------------
+
+    pub fn draw(&mut self) {
+        self.screen.clear();
+        match self.view {
+            View::Main => self.draw_list_screen("Othello", "↑↓ select · ⏎ open · ⌫ quit", self.main_items()),
+            View::NewGame => self.draw_list_screen(
+                "New game",
+                "↑↓ select · ⏎ start · ⌫ back",
+                LEVELS.iter().map(|l| l.0).collect(),
+            ),
+            View::Settings => {
+                let on = |b: bool| if b { "on" } else { "off" };
+                let items = vec![
+                    format!("Coordinates: {}", on(self.settings.show_coordinates)),
+                    format!("Show legal moves: {}", on(self.settings.show_valid_moves)),
+                    format!("Allow undo: {}", on(self.settings.allow_undo)),
+                ];
+                self.draw_list_screen("Settings", "↑↓ select · ⏎ toggle · ⌫ back", items);
+            }
+            View::Stats => self.draw_stats(),
+            View::Help => {
+                let top = self.screen.header("Help");
+                let bottom = self.screen.footer("⌫ back");
+                self.screen.para(top, bottom, GlyphStyle::Small, HELP_TEXT);
+            }
+            View::Playing => self.draw_game(false),
+            View::GameMenu => self.draw_list_screen("Game menu", "↑↓ select · ⏎ choose · ⌫ back", GAME_MENU.to_vec()),
+            View::GameOver => self.draw_game(false),
+            View::WhatIf => self.draw_game(true),
+            View::History => {
+                let lines = self.history_lines();
+                self.draw_list_screen("Move history", "↑↓ scroll · ⌫ back", lines);
+            }
+        }
+        if !self.notice.is_empty() && !matches!(self.view, View::Playing | View::GameOver | View::WhatIf) {
+            let h = self.screen.line_height(GlyphStyle::Small);
+            let y = self.screen.size().y - 2 * h - 8;
+            self.screen.text(y, GlyphStyle::Small, &self.notice);
+        }
+        self.screen.flush();
+    }
+
+    fn draw_list_screen<S: AsRef<str>>(&mut self, title: &str, hint: &str, items: Vec<S>) {
+        let top = self.screen.header(title);
+        let bottom = self.screen.footer(hint);
+        let reserve = if self.notice.is_empty() { 0 } else { self.screen.line_height(GlyphStyle::Small) + 4 };
+        self.visible_rows = self.screen.list(top, bottom - reserve, &items, &self.list);
+    }
+
+    fn draw_stats(&mut self) {
+        let top = self.screen.header("Statistics");
+        let bottom = self.screen.footer("⌫ back");
+        let mut text = String::new();
+        for (i, d) in ["Easy", "Medium", "Hard", "Expert"].iter().enumerate() {
+            let [w, l, dr] = self.stats.vs_cpu[i];
+            text.push_str(&format!("{d}: {w} won, {l} lost, {dr} drawn\n"));
+        }
+        text.push_str(&format!("Two-player games: {}\n", self.stats.two_player));
+        text.push_str("Resigning counts as a loss.");
+        self.screen.para(top, bottom, GlyphStyle::Regular, &text);
+    }
+
+    fn draw_game(&mut self, what_if: bool) {
+        let top = self.screen.header("Othello");
+        let hint = match (self.view, what_if) {
+            (_, true) => "arrows cursor · ⏎ play · F2/F3 step · ⌫ back",
+            (View::GameOver, _) => "⏎ again · N new · W what-if · H moves · ⌫ menu",
+            _ => "arrows · ⏎ place · F1 menu · F2 hint · U undo · ⌫ leave",
         };
-
-        match key {
-            // Step back in history
-            '←' | '\u{2190}' => {
-                if *view_index > 0 {
-                    *view_index -= 1;
-                    *current_game = base_game.clone_at_move(*view_index);
-                }
-                true
+        let bottom = self.screen.footer(hint);
+        let line_h = self.screen.line_height(GlyphStyle::Small);
+        let status_h = 3 * line_h;
+        let w = self.screen.size().x;
+        let geo = Geometry::fit(w, top, bottom - top - status_h, self.settings.show_coordinates);
+        let (game, mode_label) = if what_if {
+            match self.what_if.as_ref() {
+                Some(wi) => (wi.game().clone(), format!("What if: move {}/{}{}", wi.index(), wi.total(), if wi.branched() { " (branch)" } else { "" })),
+                None => return,
             }
-            // Step forward in history
-            '→' | '\u{2192}' => {
-                if *view_index < base_game.move_count() {
-                    *view_index += 1;
-                    *current_game = base_game.clone_at_move(*view_index);
-                }
-                true
+        } else {
+            match self.m.as_ref() {
+                Some(m) => (m.game().clone(), mode_name(m.mode()).to_string()),
+                None => return,
             }
-            // Cursor movement
-            '↑' | '\u{2191}' => {
-                if cursor_pos.0 > 0 {
-                    cursor_pos.0 -= 1;
-                }
-                true
-            }
-            '↓' | '\u{2193}' => {
-                if cursor_pos.0 < 7 {
-                    cursor_pos.0 += 1;
-                }
-                true
-            }
-            // Play alternate move (branch)
-            '\r' | '\n' => {
-                let position = pos(cursor_pos.0, cursor_pos.1);
-                if current_game.is_legal(position) {
-                    current_game.make_move(position);
-                    *branched = true;
-                }
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Handle key in history view
-    fn handle_history_key(&mut self, key: char) -> bool {
-        let scroll_offset = match &mut self.state {
-            AppState::MoveHistory { scroll_offset, .. } => scroll_offset,
-            _ => return false,
         };
-
-        match key {
-            '↑' | '\u{2191}' => {
-                if *scroll_offset > 0 {
-                    *scroll_offset -= 1;
-                }
-                true
+        let playing = self.view == View::Playing && self.busy != Some(Busy::Cpu);
+        let legal = if self.settings.show_valid_moves && (what_if || playing) { game.legal_moves_bitboard() } else { 0 };
+        let last = game.history().iter().rev().find(|e| !e.is_pass()).map(|e| e.pos);
+        let show_cursor = what_if || self.view == View::Playing;
+        board_view::draw(
+            &self.screen,
+            geo,
+            &board_view::View {
+                board: game.board(),
+                cursor: if show_cursor { Some(self.cursor) } else { None },
+                legal,
+                last,
+            },
+        );
+        let (b, wh) = game.counts();
+        let y = geo.y0 + 8 * geo.cell + 6;
+        self.screen.text(y, GlyphStyle::Small, &format!("{mode_label}   Black {b}  White {wh}"));
+        let line2 = if what_if {
+            format!("{} to move", name(game.current_player()))
+        } else if self.view == View::GameOver {
+            self.result_text()
+        } else if self.busy == Some(Busy::Cpu) {
+            "CPU thinking...".to_string()
+        } else if self.busy == Some(Busy::Hint) {
+            "Finding a hint...".to_string()
+        } else if let Some(m) = self.m.as_ref() {
+            match m.mode() {
+                Mode::TwoPlayer => format!("{} to move", name(game.current_player())),
+                Mode::VsCpu(_) => format!("Your move (you are {})", name(m.human())),
             }
-            '↓' | '\u{2193}' => {
-                *scroll_offset += 1;
-                true
-            }
-            _ => false,
+        } else {
+            String::new()
+        };
+        self.screen.text(y + line_h, GlyphStyle::Small, &line2);
+        if !self.notice.is_empty() {
+            self.screen.text(y + 2 * line_h, GlyphStyle::Small, &self.notice);
         }
     }
 
-    /// Handle key in settings
-    fn handle_settings_menu_key(&mut self, key: char) -> bool {
-        match key {
-            '1' => {
-                self.settings.show_coordinates = !self.settings.show_coordinates;
-                self.save_settings();
-                true
-            }
-            '2' => {
-                self.settings.show_valid_moves = !self.settings.show_valid_moves;
-                self.save_settings();
-                true
-            }
-            '3' => {
-                self.settings.allow_undo = !self.settings.allow_undo;
-                self.save_settings();
-                true
-            }
-            '4' => {
-                self.settings.vibration = !self.settings.vibration;
-                self.save_settings();
-                true
-            }
-            _ => false,
+    fn result_text(&self) -> String {
+        let Some(m) = self.m.as_ref() else { return String::new() };
+        if m.resigned() {
+            return "You resigned".into();
         }
-    }
-
-    /// Handle key in statistics view
-    fn handle_statistics_key(&mut self, _key: char) -> bool {
-        false
-    }
-
-    /// Handle key in help screen
-    fn handle_help_key(&mut self, _key: char) -> bool {
-        // Any key dismisses help
-        if let AppState::Help { previous, .. } = &self.state {
-            self.state = *previous.clone();
-            return true;
-        }
-        false
-    }
-
-    /// AI thinking tick
-    pub fn ai_tick(
-        &mut self,
-        _gam: &gam::Gam,
-        ticktimer: &ticktimer_server::Ticktimer,
-    ) {
-        if let AppState::Playing {
-            game,
-            mode: GameMode::VsCpu(difficulty),
-            ai_thinking,
-            thinking_dots,
-            show_pass_notice,
-            ..
-        } = &mut self.state
-        {
-            if *ai_thinking {
-                // Animate thinking dots
-                *thinking_dots = (*thinking_dots + 1) % 4;
-
-                // Add delay if enabled
-                if self.settings.ai_delay {
-                    ticktimer.sleep_ms(100).ok();
-                }
-
-                // Actually compute AI move
-                if let Some(pos) = find_best_move(game.board(), game.current_player(), *difficulty) {
-                    game.make_move(pos);
-                    *ai_thinking = false;
-
-                    // Check for game over
-                    if game.is_game_over() {
-                        self.handle_game_over();
-                        return;
-                    }
-
-                    // Check if player must pass
-                    if !game.has_moves() {
-                        game.pass();
-                        *show_pass_notice = true;
-
-                        // Check if AI must also pass (game over)
-                        if !game.has_moves() {
-                            game.pass();
-                            if game.is_game_over() {
-                                self.handle_game_over();
-                            }
-                        } else {
-                            // AI's turn again
-                            *ai_thinking = true;
-                        }
-                    }
-
-                    crate::feedback::vibrate_move();
-                } else {
-                    // AI must pass
-                    game.pass();
-                    *ai_thinking = false;
-
-                    if game.is_game_over() {
-                        self.handle_game_over();
-                    }
-                }
-            }
+        match m.outcome() {
+            Some(Outcome::Win) => "You win".into(),
+            Some(Outcome::Loss) => "CPU wins".into(),
+            Some(Outcome::Draw) => "Draw".into(),
+            None => match m.result().and_then(|r| r.winner()) {
+                Some(p) => format!("{} wins", name(p)),
+                None => "Draw".into(),
+            },
         }
     }
 }
