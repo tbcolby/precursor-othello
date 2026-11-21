@@ -5,22 +5,28 @@
 
 use crate::{Board, Player, Position};
 
-/// Direction shifts for move generation
-/// Each tuple: (shift amount, mask to avoid wraparound)
+/// Direction shifts for move generation.
+/// Each tuple: (shift amount, mask applied to the *source* bits before shifting).
+/// Bit index = row * 8 + col, so file A is col 0 (bits 0, 8, ...) and file H is
+/// col 7. A shift by +/-1, +/-7 or +/-9 wraps across the edge unless the source
+/// squares that would wrap are masked out first:
+/// * moves toward higher columns (+1, +9, -7) must not start on file H
+/// * moves toward lower columns (-1, +7, -9) must not start on file A
 const DIRECTIONS: [(i8, u64); 8] = [
-    // Horizontal and vertical
-    (1, 0xfefefefefefefe),   // Right (not H file)
-    (-1, 0x7f7f7f7f7f7f7f7f), // Left (not A file)
-    (8, u64::MAX),           // Down
-    (-8, u64::MAX),          // Up
-    // Diagonals
-    (9, 0xfefefefefefefe),   // Down-right
-    (7, 0x7f7f7f7f7f7f7f7f), // Down-left
-    (-7, 0xfefefefefefefe),  // Up-right
-    (-9, 0x7f7f7f7f7f7f7f7f), // Up-left
+    (1, NOT_H),
+    (-1, NOT_A),
+    (8, u64::MAX),
+    (-8, u64::MAX),
+    (9, NOT_H),
+    (7, NOT_A),
+    (-7, NOT_H),
+    (-9, NOT_A),
 ];
 
-/// Shift a bitboard in a direction
+const NOT_A: u64 = 0xfefe_fefe_fefe_fefe;
+const NOT_H: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+
+/// Shift a bitboard in a direction (mask applied before the shift).
 #[inline]
 fn shift(bits: u64, dir: i8, mask: u64) -> u64 {
     let masked = bits & mask;
@@ -57,10 +63,14 @@ impl Move {
     }
 }
 
-/// A list of legal moves (max 32 possible in any position)
+/// Largest mobility seen in any reachable Othello position is 33; 34 leaves headroom.
+pub const MAX_MOVES_PER_POSITION: usize = 34;
+
+/// A list of legal moves
+
 #[derive(Debug, Clone)]
 pub struct MoveList {
-    moves: [Move; 32],
+    moves: [Move; MAX_MOVES_PER_POSITION],
     len: usize,
 }
 
@@ -74,14 +84,14 @@ impl MoveList {
     /// Create an empty move list
     pub const fn new() -> Self {
         Self {
-            moves: [Move::new(0, 0); 32],
+            moves: [Move::new(0, 0); MAX_MOVES_PER_POSITION],
             len: 0,
         }
     }
 
     /// Add a move to the list
     pub fn push(&mut self, m: Move) {
-        if self.len < 32 {
+        if self.len < MAX_MOVES_PER_POSITION {
             self.moves[self.len] = m;
             self.len += 1;
         }
@@ -123,7 +133,7 @@ impl MoveList {
 
 /// Calculate what discs would be flipped by placing at pos
 pub fn calculate_flips(board: &Board, player: Player, pos: Position) -> u64 {
-    if board.is_occupied(pos) {
+    if pos >= 64 || board.is_occupied(pos) {
         return 0;
     }
 
@@ -154,52 +164,40 @@ pub fn calculate_flips(board: &Board, player: Player, pos: Position) -> u64 {
 /// Generate all legal moves for a player
 pub fn generate_moves(board: &Board, player: Player) -> MoveList {
     let mut moves = MoveList::new();
-    let empty = board.empty_squares();
-
-    // Check each empty square
-    for pos in Board::iter_bits(empty) {
-        let flipped = calculate_flips(board, player, pos);
-        if flipped != 0 {
-            moves.push(Move::new(pos, flipped));
-        }
+    for pos in Board::iter_bits(legal_moves_bitboard(board, player)) {
+        moves.push(Move::new(pos, calculate_flips(board, player, pos)));
     }
-
     moves
 }
 
-/// Get a quick count of legal moves without generating the full list
+/// Count legal moves without generating the full list.
 pub fn count_moves(board: &Board, player: Player) -> u32 {
-    let empty = board.empty_squares();
-    let mut count = 0;
-
-    for pos in Board::iter_bits(empty) {
-        if calculate_flips(board, player, pos) != 0 {
-            count += 1;
-        }
-    }
-
-    count
+    legal_moves_bitboard(board, player).count_ones()
 }
 
 /// Check if a specific move is legal
 pub fn is_legal_move(board: &Board, player: Player, pos: Position) -> bool {
-    if board.is_occupied(pos) {
+    if pos >= 64 || board.is_occupied(pos) {
         return false;
     }
     calculate_flips(board, player, pos) != 0
 }
 
-/// Get all legal move positions as a bitboard (for highlighting)
+/// Get all legal move positions as a bitboard (Dumb7Fill in each direction).
 pub fn legal_moves_bitboard(board: &Board, player: Player) -> u64 {
+    let own = board.get(player);
+    let opp = board.get(player.opponent());
     let empty = board.empty_squares();
     let mut legal = 0u64;
-
-    for pos in Board::iter_bits(empty) {
-        if calculate_flips(board, player, pos) != 0 {
-            legal |= 1u64 << pos;
+    for &(dir, mask) in &DIRECTIONS {
+        // Runs of opponent discs adjacent to our discs in this direction...
+        let mut run = shift(own, dir, mask) & opp;
+        for _ in 0..5 {
+            run |= shift(run, dir, mask) & opp;
         }
+        // ...that end on an empty square.
+        legal |= shift(run, dir, mask) & empty;
     }
-
     legal
 }
 
@@ -251,23 +249,178 @@ mod tests {
         assert_eq!(calculate_flips(&board, Player::White, pos(3, 4)), 0);
     }
 
+    fn board_from(black: &[Position], white: &[Position]) -> Board {
+        let mut b = Board::empty();
+        for &p in black {
+            b.place(Player::Black, p);
+        }
+        for &p in white {
+            b.place(Player::White, p);
+        }
+        b
+    }
+
+    // Regression for audit O-1: direction masks were swapped/truncated, so edge
+    // captures failed. White B1, Black C1: Black A1 flips B1 (rightward capture
+    // starting on file A).
     #[test]
-    fn test_multiple_direction_flip() {
-        // Create a position where a move flips in multiple directions
-        let mut board = Board::empty();
+    fn edge_capture_rightward_from_file_a() {
+        let b = board_from(&[2], &[1]);
+        assert_eq!(calculate_flips(&b, Player::Black, 0), 1 << 1);
+    }
 
-        // Set up: Black at A1, White at B1, B2
-        board.place(Player::Black, pos(0, 0)); // A1
-        board.place(Player::Black, pos(2, 2)); // C3
-        board.place(Player::White, pos(1, 1)); // B2
+    #[test]
+    fn edge_capture_leftward_from_file_h() {
+        // Black F1, White G1, Black plays H1.
+        let b = board_from(&[5], &[6]);
+        assert_eq!(calculate_flips(&b, Player::Black, 7), 1 << 6);
+    }
 
-        // C1 should flip B2 (diagonal)
-        let flipped = calculate_flips(&board, Player::Black, pos(0, 2));
-        assert_eq!(flipped, 0); // B2 is not between A1 and C1 diagonally
+    #[test]
+    fn row_eight_horizontal() {
+        // Row 8 (bits 56..63) was zeroed by the 14-digit mask.
+        let b = board_from(&[58], &[57]);
+        assert_eq!(calculate_flips(&b, Player::Black, 56), 1 << 57);
+        let b = board_from(&[61], &[62]);
+        assert_eq!(calculate_flips(&b, Player::Black, 63), 1 << 62);
+    }
 
-        // A3 would flip B2 diagonally
-        let flipped = calculate_flips(&board, Player::Black, pos(2, 0));
-        assert_eq!(flipped, 0); // Not on the right diagonal
+    #[test]
+    fn no_wraparound_across_edges() {
+        // Black H3 (23), White A4 (24): next to each other in bit order only.
+        // Black playing... nothing flips across the board edge.
+        let b = board_from(&[23], &[24]);
+        assert_eq!(calculate_flips(&b, Player::Black, 25), 0);
+        // White at H2 (15), Black A3 (16): a bit-adjacent wrap pair.
+        let b = board_from(&[16], &[15]);
+        assert_eq!(calculate_flips(&b, Player::Black, 14), 0);
+        assert_eq!(legal_moves_bitboard(&b, Player::Black), 0);
+    }
+
+    #[test]
+    fn diagonals_in_all_four_directions() {
+        // Centre target D4 (27). Black at distance 2 on each diagonal, White between.
+        for (white, black) in [(18u8, 9u8), (20, 13), (34, 41), (36, 45)] {
+            let b = board_from(&[black], &[white]);
+            assert_eq!(calculate_flips(&b, Player::Black, 27), 1 << white, "diag via {white}");
+        }
+    }
+
+    #[test]
+    fn multi_direction_flip() {
+        // Black plays D4 (27); flips C4 (26, west, anchor B4=25) and D5 (35, south, anchor D6=43)
+        // and E5 (36, SE diagonal, anchor F6=45).
+        let b = board_from(&[25, 43, 45], &[26, 35, 36]);
+        assert_eq!(calculate_flips(&b, Player::Black, 27), (1 << 26) | (1 << 35) | (1 << 36));
+    }
+
+    /// Slow, obviously-correct reference: walk rays with (row, col) arithmetic.
+    fn naive_flips(board: &Board, player: Player, pos: Position) -> u64 {
+        if board.is_occupied(pos) {
+            return 0;
+        }
+        let (r0, c0) = ((pos / 8) as i32, (pos % 8) as i32);
+        let mut flipped = 0u64;
+        for dr in -1i32..=1 {
+            for dc in -1i32..=1 {
+                if dr == 0 && dc == 0 {
+                    continue;
+                }
+                let (mut r, mut c) = (r0 + dr, c0 + dc);
+                let mut run = 0u64;
+                while (0..8).contains(&r) && (0..8).contains(&c) {
+                    let p = (r * 8 + c) as u8;
+                    if board.has_disc(player.opponent(), p) {
+                        run |= 1 << p;
+                    } else {
+                        if board.has_disc(player, p) {
+                            flipped |= run;
+                        }
+                        break;
+                    }
+                    r += dr;
+                    c += dc;
+                }
+            }
+        }
+        flipped
+    }
+
+    /// Deterministic xorshift for reproducible random playouts.
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn differential_against_naive_over_random_playouts() {
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut positions = 0;
+        for _ in 0..150 {
+            let mut b = Board::new();
+            let mut player = Player::Black;
+            for _ply in 0..80 {
+                let mut legal = 0u64;
+                for p in 0..64u8 {
+                    let f = calculate_flips(&b, player, p);
+                    assert_eq!(f, naive_flips(&b, player, p), "flips at {p}");
+                    if f != 0 {
+                        legal |= 1 << p;
+                    }
+                }
+                assert_eq!(legal_moves_bitboard(&b, player), legal);
+                assert_eq!(count_moves(&b, player), legal.count_ones());
+                positions += 1;
+                if legal == 0 {
+                    if legal_moves_bitboard(&b, player.opponent()) == 0 {
+                        break;
+                    }
+                    player = player.opponent();
+                    continue;
+                }
+                let n = legal.count_ones() as u64;
+                let pick = (xorshift(&mut seed) % n) as usize;
+                let p = Board::iter_bits(legal).nth(pick).unwrap();
+                let f = calculate_flips(&b, player, p);
+                b.place(player, p);
+                b.flip(player.opponent(), f);
+                player = player.opponent();
+            }
+        }
+        assert!(positions > 5000);
+    }
+
+    fn perft(board: &Board, player: Player, depth: u32) -> u64 {
+        if depth == 0 {
+            return 1;
+        }
+        let moves = generate_moves(board, player);
+        if moves.is_empty() {
+            if legal_moves_bitboard(board, player.opponent()) == 0 {
+                return 1; // game over: a leaf
+            }
+            return perft(board, player.opponent(), depth - 1);
+        }
+        let mut n = 0;
+        for m in moves.iter() {
+            let mut nb = *board;
+            nb.place(player, m.pos);
+            nb.flip(player.opponent(), m.flipped);
+            n += perft(&nb, player.opponent(), depth - 1);
+        }
+        n
+    }
+
+    // Standard Othello perft values from the initial position (passes count as a ply).
+    #[test]
+    fn perft_standard_counts() {
+        let b = Board::new();
+        let expected = [1u64, 4, 12, 56, 244, 1396, 8200];
+        for (d, &e) in expected.iter().enumerate() {
+            assert_eq!(perft(&b, Player::Black, d as u32), e, "perft({d})");
+        }
     }
 
     #[test]

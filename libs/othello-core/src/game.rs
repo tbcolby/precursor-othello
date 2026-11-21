@@ -3,8 +3,13 @@
 use crate::{Board, Move, MoveList, Player, Position};
 use crate::moves::{calculate_flips, count_moves, generate_moves};
 
-/// Maximum number of moves in a game (theoretical max is 60)
-pub const MAX_MOVES: usize = 64;
+/// History capacity: at most 60 discs are placed, and passes are recorded too.
+/// A pass needs the other side to have a move, so passes can never outnumber
+/// placements; 128 is a hard upper bound on history entries.
+pub const MAX_MOVES: usize = 128;
+
+/// Marker stored in `HistoryEntry::pos` for a pass.
+pub const PASS: u8 = 255;
 
 /// Result of a completed game
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +53,7 @@ pub struct HistoryEntry {
 impl HistoryEntry {
     /// Check if this was a pass
     pub const fn is_pass(&self) -> bool {
-        self.pos == 255
+        self.pos == PASS
     }
 }
 
@@ -186,21 +191,23 @@ impl GameState {
             return None;
         }
 
+        if self.history_len >= MAX_MOVES {
+            return None;
+        }
+
         // Place disc
         self.board.place(self.current_player, pos);
 
         // Flip opponent discs
         self.board.flip(self.current_player.opponent(), flipped);
 
-        // Record in history
-        if self.history_len < MAX_MOVES {
-            self.history[self.history_len] = HistoryEntry {
-                pos,
-                flipped,
-                player: self.current_player,
-            };
-            self.history_len += 1;
-        }
+        // Record in history (capacity checked above)
+        self.history[self.history_len] = HistoryEntry {
+            pos,
+            flipped,
+            player: self.current_player,
+        };
+        self.history_len += 1;
 
         // Reset consecutive passes
         self.consecutive_passes = 0;
@@ -216,19 +223,16 @@ impl GameState {
     /// Returns true if the pass was valid
     pub fn pass(&mut self) -> bool {
         // Can only pass if no legal moves
-        if self.has_moves() {
+        if self.has_moves() || self.history_len >= MAX_MOVES || self.is_game_over() {
             return false;
         }
 
-        // Record pass in history
-        if self.history_len < MAX_MOVES {
-            self.history[self.history_len] = HistoryEntry {
-                pos: 255, // Special marker for pass
-                flipped: 0,
-                player: self.current_player,
-            };
-            self.history_len += 1;
-        }
+        self.history[self.history_len] = HistoryEntry {
+            pos: PASS,
+            flipped: 0,
+            player: self.current_player,
+        };
+        self.history_len += 1;
 
         self.consecutive_passes += 1;
         self.current_player = self.current_player.opponent();
@@ -310,6 +314,42 @@ impl GameState {
 mod tests {
     use super::*;
     use crate::pos;
+
+    #[test]
+    fn history_holds_a_full_game_with_passes() {
+        // Play random games to the end; nothing is ever dropped.
+        let mut seed = 99u64;
+        for _ in 0..40 {
+            let mut g = GameState::new();
+            let mut guard = 0;
+            while !g.is_game_over() && guard < 200 {
+                guard += 1;
+                let legal = g.legal_moves_bitboard();
+                if legal == 0 {
+                    assert!(g.pass());
+                    continue;
+                }
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let p = Board::iter_bits(legal).nth((seed % legal.count_ones() as u64) as usize).unwrap();
+                assert!(g.make_move(p).is_some());
+            }
+            assert!(g.is_game_over());
+            // Replaying the history reproduces the board exactly.
+            let replay = g.clone_at_move(g.move_count());
+            assert_eq!(replay.board(), g.board());
+            assert_eq!(replay.move_count(), g.move_count());
+        }
+    }
+
+    #[test]
+    fn out_of_range_position_is_illegal_not_a_panic() {
+        let mut g = GameState::new();
+        assert!(!g.is_legal(64));
+        assert!(!g.is_legal(255));
+        assert!(g.make_move(200).is_none());
+    }
 
     #[test]
     fn test_new_game() {

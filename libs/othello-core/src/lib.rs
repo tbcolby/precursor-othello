@@ -4,25 +4,33 @@
 //! - Efficient bitboard representation
 //! - Move generation and validation
 //! - Game state management with full history
-//! - AI with multiple difficulty levels
+//! - AI with multiple difficulty levels, node/time-bounded and cancellable
+//! - Match flow (turns, passes, undo, resign, save encoding), stats, settings
 //!
 //! This library is `no_std` compatible (disable default features).
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+extern crate alloc;
+
 mod board;
 mod moves;
-mod game;
+pub mod game;
 mod eval;
 mod ai;
-mod opening;
+mod session;
+mod persist;
+mod review;
 
 pub use board::{Board, Player};
 pub use moves::{Move, MoveList, count_moves, legal_moves_bitboard, calculate_flips};
 pub use game::{GameState, GameResult};
 pub use eval::evaluate;
 pub use ai::{Difficulty, find_best_move, get_hint};
-pub use opening::OpeningBook;
+pub use session::{Match, Mode, Outcome, PlayError, DecodeError};
+pub use persist::{Settings, Stats};
+pub use review::WhatIf;
+pub use ai::{find_best_move_limited, Limits};
 
 /// Position on the board (0-63)
 pub type Position = u8;
